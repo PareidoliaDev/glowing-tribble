@@ -2,7 +2,7 @@ name: build
 
 on:
   schedule:
-    - cron: "0 6 * * *"
+    - cron: "20 */6 * * *"
   push:
     branches: [ master, main ]
   pull_request:
@@ -11,6 +11,10 @@ on:
 
 permissions:
   contents: write
+
+concurrency:
+  group: jupiter-kernel-build
+  cancel-in-progress: false
 
 env:
   MIRROR: https://steamdeck-packages.steamos.cloud/archlinux-mirror
@@ -22,19 +26,27 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       series: ${{ steps.set.outputs.series }}
+      fingerprint: ${{ steps.set.outputs.fingerprint }}
+      should_build: ${{ steps.set.outputs.should_build }}
     steps:
       - id: set
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           repos=$(curl -fsSL "$MIRROR/" \
-            | grep -oE 'href="(jupiter|holo)-[^"/]+/"' \
+            | grep -oE 'href="jupiter-[^"/]+/"' \
             | sed -E 's|href="([^"]+)/"|\1|' | sort -u)
+          : > /tmp/packages
           : > /tmp/pairs
           for r in $repos; do
             curl -fsSL "$MIRROR/$r/os/x86_64/" 2>/dev/null \
-              | grep -oE 'linux-neptune-[a-zA-Z0-9_-]+-headers-[0-9]+\.[0-9]+' \
-              | sed -E 's/(linux-neptune-[a-zA-Z0-9_-]+-headers)-([0-9]+\.[0-9]+)/\2 \1/' >> /tmp/pairs || true
+              | grep -oE 'linux-neptune-[a-zA-Z0-9_-]+-headers-[0-9][^"<]*\.pkg\.tar\.zst' \
+              >> /tmp/packages || true
           done
+          sort -Vu -o /tmp/packages /tmp/packages
+          sed -E 's/(linux-neptune-[a-zA-Z0-9_-]+-headers)-([0-9]+\.[0-9]+).*/\2 \1/' \
+            /tmp/packages | sort -u > /tmp/pairs
           series=$(sort -u /tmp/pairs | while read -r ver name; do
             if [ "$(printf '%s\n%s\n' "$MIN_KVER" "$ver" | sort -V | head -1)" = "$MIN_KVER" ]; then
               echo "$name"
@@ -47,8 +59,32 @@ jobs:
           json=$(printf '%s\n' $series | jq -R . | jq -cs .)
           echo "series=$json" >> "$GITHUB_OUTPUT"
 
+          # The newest KEEP packages in every supported series define the input
+          # set. A changed set means Jupiter published a kernel update.
+          : > /tmp/selected
+          while read -r name; do
+            grep -E "^${name}-[0-9]" /tmp/packages | sort -V | tail -n "$KEEP" \
+              >> /tmp/selected
+          done <<< "$series"
+          fingerprint=$(sort -u /tmp/selected | sha256sum | cut -d' ' -f1)
+          latest=$(sort -V /tmp/selected | tail -n 1)
+          echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
+          echo "Jupiter input fingerprint: $fingerprint"
+          echo "Newest package: $latest"
+
+          previous=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .body 2>/dev/null \
+            | sed -n 's/^Jupiter fingerprint: `\([^`]*\)`.*/\1/p' | head -n 1 || true)
+          if [ "$GITHUB_EVENT_NAME" = schedule ] && [ "$fingerprint" = "$previous" ]; then
+            echo "No new Jupiter kernel update; skipping the build."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "New Jupiter kernel input (or a non-scheduled run); building."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
     needs: discover
+    if: needs.discover.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     container:
       image: archlinux:latest
@@ -64,7 +100,7 @@ jobs:
           # `pacman -U` on individual (unsigned) .pkg files needs sig checks off.
           sed -i 's/^SigLevel.*/SigLevel = Never/' /etc/pacman.conf
           repos=$(curl -fsSL "$MIRROR/" \
-            | grep -oE 'href="(jupiter|holo)-[^"/]+/"' \
+            | grep -oE 'href="jupiter-[^"/]+/"' \
             | sed -E 's|href="([^"]+)/"|\1|' | sort -u)
           for r in $repos; do
             if curl -fsSL -o /dev/null "$MIRROR/$r/os/x86_64/$r.db"; then
@@ -93,10 +129,10 @@ jobs:
           MANIFEST="$CACHE/built.tsv"
           touch "$MANIFEST"
 
-          # Enumerate this series' headers .pkg files across all channels
+          # Enumerate this series' headers .pkg files across Jupiter channels
           declare -A URLOF
           for repo in $(pacman-conf --repo-list); do
-            case "$repo" in jupiter-*|holo-*) ;; *) continue ;; esac
+            case "$repo" in jupiter-*) ;; *) continue ;; esac
             base="$MIRROR/$repo/os/x86_64"
             while read -r f; do
               [ -n "$f" ] || continue
@@ -156,8 +192,8 @@ jobs:
           if-no-files-found: ignore
 
   release:
-    needs: build
-    if: github.event_name != 'pull_request'
+    needs: [discover, build]
+    if: needs.discover.outputs.should_build == 'true' && needs.build.result == 'success' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v8
@@ -167,8 +203,10 @@ jobs:
           merge-multiple: true
 
       - id: release_info
+        env:
+          FINGERPRINT: ${{ needs.discover.outputs.fingerprint }}
         run: |
-          echo "tag=v$(date +'%Y.%m.%d')-${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+          echo "tag=v$(date +'%Y.%m.%d')-${GITHUB_SHA:0:7}-${FINGERPRINT:0:12}" >> "$GITHUB_OUTPUT"
           echo "date=$(date +'%Y-%m-%d %H:%M:%S UTC')" >> "$GITHUB_OUTPUT"
 
       - name: Create Release
@@ -178,6 +216,7 @@ jobs:
           name: "SteamOS ${{ steps.release_info.outputs.tag }}"
           body: |
             Automated build for SteamOS created on ${{ steps.release_info.outputs.date }}
+            Jupiter fingerprint: `${{ needs.discover.outputs.fingerprint }}`
           files: out/*.ko
           draft: false
           prerelease: false
