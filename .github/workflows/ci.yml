@@ -2,7 +2,7 @@ name: build
 
 on:
   schedule:
-    - cron: "20 */6 * * *"
+    - cron: "10 * * * *"
   push:
     branches: [ master, main ]
   pull_request:
@@ -27,6 +27,7 @@ jobs:
     outputs:
       series: ${{ steps.set.outputs.series }}
       fingerprint: ${{ steps.set.outputs.fingerprint }}
+      jupiter_repo: ${{ steps.set.outputs.jupiter_repo }}
       should_build: ${{ steps.set.outputs.should_build }}
     steps:
       - id: set
@@ -34,17 +35,21 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          repos=$(curl -fsSL "$MIRROR/" \
-            | grep -oE 'href="jupiter-[^"/]+/"' \
-            | sed -E 's|href="([^"]+)/"|\1|' | sort -u)
-          : > /tmp/packages
+          jupiter_repo=$(curl -fsSL "$MIRROR/" \
+            | grep -oE 'href="jupiter-[0-9]+(\.[0-9]+)*x?/"' \
+            | sed -E 's|href="([^"]+)/"|\1|' \
+            | sort -V | tail -n 1)
+          if [ -z "$jupiter_repo" ]; then
+            echo "No versioned Jupiter repository found" >&2; exit 1
+          fi
+          echo "Using stable repository: $jupiter_repo"
+          echo "jupiter_repo=$jupiter_repo" >> "$GITHUB_OUTPUT"
+
+          base="$MIRROR/$jupiter_repo/os/x86_64"
+          curl -fsSL "$base/" \
+            | grep -oE 'linux-neptune-[a-zA-Z0-9_-]+-headers-[0-9][^"<]*\.pkg\.tar\.zst' \
+            | sort -Vu > /tmp/packages
           : > /tmp/pairs
-          for r in $repos; do
-            curl -fsSL "$MIRROR/$r/os/x86_64/" 2>/dev/null \
-              | grep -oE 'linux-neptune-[a-zA-Z0-9_-]+-headers-[0-9][^"<]*\.pkg\.tar\.zst' \
-              >> /tmp/packages || true
-          done
-          sort -Vu -o /tmp/packages /tmp/packages
           sed -E 's/(linux-neptune-[a-zA-Z0-9_-]+-headers)-([0-9]+\.[0-9]+).*/\2 \1/' \
             /tmp/packages | sort -u > /tmp/pairs
           series=$(sort -u /tmp/pairs | while read -r ver name; do
@@ -86,6 +91,8 @@ jobs:
     needs: discover
     if: needs.discover.outputs.should_build == 'true'
     runs-on: ubuntu-latest
+    env:
+      JUPITER_REPO: ${{ needs.discover.outputs.jupiter_repo }}
     container:
       image: archlinux:latest
     strategy:
@@ -99,14 +106,14 @@ jobs:
         run: |
           # `pacman -U` on individual (unsigned) .pkg files needs sig checks off.
           sed -i 's/^SigLevel.*/SigLevel = Never/' /etc/pacman.conf
-          repos=$(curl -fsSL "$MIRROR/" \
-            | grep -oE 'href="jupiter-[^"/]+/"' \
-            | sed -E 's|href="([^"]+)/"|\1|' | sort -u)
-          for r in $repos; do
-            if curl -fsSL -o /dev/null "$MIRROR/$r/os/x86_64/$r.db"; then
-              { echo; echo "[$r]"; echo "Server = $MIRROR/\$repo/os/\$arch"; echo "SigLevel = Never"; } >> /etc/pacman.conf
-            fi
-          done
+          curl -fsSL -o /dev/null \
+            "$MIRROR/$JUPITER_REPO/os/x86_64/$JUPITER_REPO.db"
+          {
+            echo
+            echo "[$JUPITER_REPO]"
+            echo "Server = $MIRROR/\$repo/os/\$arch"
+            echo "SigLevel = Never"
+          } >> /etc/pacman.conf
 
       - name: Install toolchain
         run: pacman -Syu --noconfirm base-devel clang make lld llvm git
@@ -129,18 +136,14 @@ jobs:
           MANIFEST="$CACHE/built.tsv"
           touch "$MANIFEST"
 
-          # Enumerate this series' headers .pkg files across Jupiter channels
+          # Enumerate this series' headers from the selected stable channel.
           declare -A URLOF
-          for repo in $(pacman-conf --repo-list); do
-            case "$repo" in jupiter-*) ;; *) continue ;; esac
-            base="$MIRROR/$repo/os/x86_64"
-            while read -r f; do
-              [ -n "$f" ] || continue
-              [ -n "${URLOF[$f]:-}" ] && continue
-              URLOF[$f]="$base/$f"
-            done < <(curl -fsSL "$base/" \
-              | grep -oE "${SERIES}-[0-9][^\"]*\.pkg\.tar\.zst" | sort -u)
-          done
+          base="$MIRROR/$JUPITER_REPO/os/x86_64"
+          while read -r f; do
+            [ -n "$f" ] || continue
+            URLOF[$f]="$base/$f"
+          done < <(curl -fsSL "$base/" \
+            | grep -oE "${SERIES}-[0-9][^\"]*\.pkg\.tar\.zst" | sort -u)
 
           mapfile -t buildfiles < <(printf '%s\n' "${!URLOF[@]}" | sort -V | tail -n "$KEEP")
           echo "Considering ${#buildfiles[@]} sub-builds of $SERIES"
