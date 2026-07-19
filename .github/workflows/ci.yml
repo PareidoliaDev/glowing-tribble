@@ -36,17 +36,11 @@ jobs:
         run: |
           set -euo pipefail
           root_index=$(curl -fsSL "$MIRROR/")
-          stable_repo=$(grep -oE 'href="jupiter-[0-9]+(\.[0-9]+)*x?/"' \
-            <<< "$root_index" | sed -E 's|href="([^"]+)/"|\1|' \
-            | sort -V | tail -n 1)
-          beta_repos=$(grep -oE 'href="jupiter-(main|rel|staging)/"' \
+          candidates=$(grep -oE 'href="(jupiter|holo)-[^"/]+/"' \
             <<< "$root_index" | sed -E 's|href="([^"]+)/"|\1|' | sort -u)
-          repos=$(printf '%s\n%s\n' "$stable_repo" "$beta_repos" | sed '/^$/d')
-          if [ -z "$repos" ]; then
-            echo "No Jupiter repositories found" >&2; exit 1
+          if [ -z "$candidates" ]; then
+            echo "No Jupiter/Holo repositories found" >&2; exit 1
           fi
-          echo "Jupiter repositories:"; echo "$repos"
-          echo "jupiter_repos=$(printf '%s ' $repos)" >> "$GITHUB_OUTPUT"
 
           : > /tmp/inventory
           while read -r repo; do
@@ -57,7 +51,14 @@ jobs:
             done < <(curl -fsSL "$base/" \
               | grep -oE 'linux-neptune-[a-zA-Z0-9_-]+-headers-[0-9][^"<]*\.pkg\.tar\.zst' \
               | sort -Vu || true)
-          done <<< "$repos"
+          done <<< "$candidates"
+          if [ ! -s /tmp/inventory ]; then
+            echo "No Neptune header packages found" >&2; exit 1
+          fi
+          repos=$(cut -f1 /tmp/inventory | sort -u)
+          echo "Repositories containing Neptune headers:"; echo "$repos"
+          echo "jupiter_repos=$(printf '%s ' $repos)" >> "$GITHUB_OUTPUT"
+
           cut -f2 /tmp/inventory | sort -Vu > /tmp/packages
           : > /tmp/pairs
           sed -E 's/(linux-neptune-[a-zA-Z0-9_-]+-headers)-([0-9]+\.[0-9]+).*/\2 \1/' \
@@ -116,13 +117,14 @@ jobs:
         run: |
           sed -i 's/^SigLevel.*/SigLevel = Never/' /etc/pacman.conf
           for repo in $JUPITER_REPOS; do
-            curl -fsSL -o /dev/null "$MIRROR/$repo/os/x86_64/$repo.db"
-            {
-              echo
-              echo "[$repo]"
-              echo "Server = $MIRROR/\$repo/os/\$arch"
-              echo "SigLevel = Never"
-            } >> /etc/pacman.conf
+            if curl -fsSL -o /dev/null "$MIRROR/$repo/os/x86_64/$repo.db"; then
+              {
+                echo
+                echo "[$repo]"
+                echo "Server = $MIRROR/\$repo/os/\$arch"
+                echo "SigLevel = Never"
+              } >> /etc/pacman.conf
+            fi
           done
 
       - name: Install toolchain
