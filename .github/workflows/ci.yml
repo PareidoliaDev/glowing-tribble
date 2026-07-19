@@ -27,7 +27,7 @@ jobs:
     outputs:
       series: ${{ steps.set.outputs.series }}
       fingerprint: ${{ steps.set.outputs.fingerprint }}
-      jupiter_repo: ${{ steps.set.outputs.jupiter_repo }}
+      jupiter_repos: ${{ steps.set.outputs.jupiter_repos }}
       should_build: ${{ steps.set.outputs.should_build }}
     steps:
       - id: set
@@ -35,20 +35,30 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          jupiter_repo=$(curl -fsSL "$MIRROR/" \
-            | grep -oE 'href="jupiter-[0-9]+(\.[0-9]+)*x?/"' \
-            | sed -E 's|href="([^"]+)/"|\1|' \
+          root_index=$(curl -fsSL "$MIRROR/")
+          stable_repo=$(grep -oE 'href="jupiter-[0-9]+(\.[0-9]+)*x?/"' \
+            <<< "$root_index" | sed -E 's|href="([^"]+)/"|\1|' \
             | sort -V | tail -n 1)
-          if [ -z "$jupiter_repo" ]; then
-            echo "No versioned Jupiter repository found" >&2; exit 1
+          beta_repos=$(grep -oE 'href="jupiter-(main|rel|staging)/"' \
+            <<< "$root_index" | sed -E 's|href="([^"]+)/"|\1|' | sort -u)
+          repos=$(printf '%s\n%s\n' "$stable_repo" "$beta_repos" | sed '/^$/d')
+          if [ -z "$repos" ]; then
+            echo "No Jupiter repositories found" >&2; exit 1
           fi
-          echo "Using stable repository: $jupiter_repo"
-          echo "jupiter_repo=$jupiter_repo" >> "$GITHUB_OUTPUT"
+          echo "Jupiter repositories:"; echo "$repos"
+          echo "jupiter_repos=$(printf '%s ' $repos)" >> "$GITHUB_OUTPUT"
 
-          base="$MIRROR/$jupiter_repo/os/x86_64"
-          curl -fsSL "$base/" \
-            | grep -oE 'linux-neptune-[a-zA-Z0-9_-]+-headers-[0-9][^"<]*\.pkg\.tar\.zst' \
-            | sort -Vu > /tmp/packages
+          : > /tmp/inventory
+          while read -r repo; do
+            base="$MIRROR/$repo/os/x86_64"
+            while read -r package; do
+              [ -n "$package" ] || continue
+              printf '%s\t%s\n' "$repo" "$package" >> /tmp/inventory
+            done < <(curl -fsSL "$base/" \
+              | grep -oE 'linux-neptune-[a-zA-Z0-9_-]+-headers-[0-9][^"<]*\.pkg\.tar\.zst' \
+              | sort -Vu || true)
+          done <<< "$repos"
+          cut -f2 /tmp/inventory | sort -Vu > /tmp/packages
           : > /tmp/pairs
           sed -E 's/(linux-neptune-[a-zA-Z0-9_-]+-headers)-([0-9]+\.[0-9]+).*/\2 \1/' \
             /tmp/packages | sort -u > /tmp/pairs
@@ -92,7 +102,7 @@ jobs:
     if: needs.discover.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     env:
-      JUPITER_REPO: ${{ needs.discover.outputs.jupiter_repo }}
+      JUPITER_REPOS: ${{ needs.discover.outputs.jupiter_repos }}
     container:
       image: archlinux:latest
     strategy:
@@ -104,20 +114,20 @@ jobs:
 
       - name: Add repositories
         run: |
-          # `pacman -U` on individual (unsigned) .pkg files needs sig checks off.
           sed -i 's/^SigLevel.*/SigLevel = Never/' /etc/pacman.conf
-          curl -fsSL -o /dev/null \
-            "$MIRROR/$JUPITER_REPO/os/x86_64/$JUPITER_REPO.db"
-          {
-            echo
-            echo "[$JUPITER_REPO]"
-            echo "Server = $MIRROR/\$repo/os/\$arch"
-            echo "SigLevel = Never"
-          } >> /etc/pacman.conf
+          for repo in $JUPITER_REPOS; do
+            curl -fsSL -o /dev/null "$MIRROR/$repo/os/x86_64/$repo.db"
+            {
+              echo
+              echo "[$repo]"
+              echo "Server = $MIRROR/\$repo/os/\$arch"
+              echo "SigLevel = Never"
+            } >> /etc/pacman.conf
+          done
 
       - name: Install toolchain
         run: pacman -Syu --noconfirm base-devel clang make lld llvm git
-        
+
       - name: Restore build cache
         uses: actions/cache@v6
         with:
@@ -136,14 +146,16 @@ jobs:
           MANIFEST="$CACHE/built.tsv"
           touch "$MANIFEST"
 
-          # Enumerate this series' headers from the selected stable channel.
           declare -A URLOF
-          base="$MIRROR/$JUPITER_REPO/os/x86_64"
-          while read -r f; do
-            [ -n "$f" ] || continue
-            URLOF[$f]="$base/$f"
-          done < <(curl -fsSL "$base/" \
-            | grep -oE "${SERIES}-[0-9][^\"]*\.pkg\.tar\.zst" | sort -u)
+          for repo in $JUPITER_REPOS; do
+            base="$MIRROR/$repo/os/x86_64"
+            while read -r f; do
+              [ -n "$f" ] || continue
+              [ -n "${URLOF[$f]:-}" ] && continue
+              URLOF[$f]="$base/$f"
+            done < <(curl -fsSL "$base/" \
+              | grep -oE "${SERIES}-[0-9][^\"]*\.pkg\.tar\.zst" | sort -u)
+          done
 
           mapfile -t buildfiles < <(printf '%s\n' "${!URLOF[@]}" | sort -V | tail -n "$KEEP")
           echo "Considering ${#buildfiles[@]} sub-builds of $SERIES"
